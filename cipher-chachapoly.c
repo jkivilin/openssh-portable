@@ -23,19 +23,70 @@
 #include <string.h>
 #include <stdio.h>  /* needed for misc.h */
 
+#include <gcrypt.h>
+
 #include "log.h"
 #include "sshbuf.h"
 #include "ssherr.h"
 #include "cipher-chachapoly.h"
 
+void chachapoly_free(struct chachapoly_ctx *ctx)
+{
+	if (ctx->initialized) {
+		gcry_cipher_close(ctx->main_hd);
+		gcry_cipher_close(ctx->header_hd);
+		gcry_mac_close(ctx->mac_hd);
+		ctx->initialized = 0;
+	}
+}
+
 int chachapoly_init(struct chachapoly_ctx *ctx,
     const u_char *key, u_int keylen)
 {
+	static int gcrypt_initialized;
+
 	if (keylen != (32 + 32)) /* 2 x 256 bit keys */
 		return SSH_ERR_INVALID_ARGUMENT;
-	chacha_keysetup(&ctx->main_ctx, key, 256);
-	chacha_keysetup(&ctx->header_ctx, key + 32, 256);
+
+	if (!gcrypt_initialized) {
+		if (!gcry_check_version(GCRYPT_VERSION))
+			return SSH_ERR_INTERNAL_ERROR;
+		gcry_control(GCRYCTL_DISABLE_SECMEM, 0);
+		gcry_control(GCRYCTL_INITIALIZATION_FINISHED, 0);
+		gcrypt_initialized = 1;
+	}
+
+	if (!ctx->initialized) {
+		/* Open cipher/mac handles. */
+		if (gcry_cipher_open(&ctx->main_hd, GCRY_CIPHER_CHACHA20,
+				    GCRY_CIPHER_MODE_STREAM, 0))
+			return SSH_ERR_INTERNAL_ERROR;
+		if (gcry_cipher_open(&ctx->header_hd, GCRY_CIPHER_CHACHA20,
+				    GCRY_CIPHER_MODE_STREAM, 0)) {
+			gcry_cipher_close(ctx->main_hd);
+			return SSH_ERR_INTERNAL_ERROR;
+		}
+		if (gcry_mac_open(&ctx->mac_hd, GCRY_MAC_POLY1305, 0, NULL)) {
+			gcry_cipher_close(ctx->main_hd);
+			gcry_cipher_close(ctx->header_hd);
+			return SSH_ERR_INTERNAL_ERROR;
+		}
+
+		ctx->initialized = 1;
+	} else {
+		/* Already open, rekeying? */
+	}
+
+	if (gcry_cipher_setkey(ctx->main_hd, key, 32))
+		goto err_out;
+	if (gcry_cipher_setkey(ctx->header_hd, key + 32, 32))
+		goto err_out;
+
 	return 0;
+
+ err_out:
+	chachapoly_free(ctx);
+	return SSH_ERR_INTERNAL_ERROR;
 }
 
 /*
@@ -52,50 +103,71 @@ chachapoly_crypt(struct chachapoly_ctx *ctx, u_int seqnr, u_char *dest,
     const u_char *src, u_int len, u_int aadlen, u_int authlen, int do_encrypt)
 {
 	u_char seqbuf[8];
-	const u_char one[8] = { 1, 0, 0, 0, 0, 0, 0, 0 }; /* NB little-endian */
-	u_char expected_tag[POLY1305_TAGLEN], poly_key[POLY1305_KEYLEN];
+	u_char poly_key[CHACHA20_BLOCKSIZE];
 	int r = SSH_ERR_INTERNAL_ERROR;
+	gcry_error_t ret;
 
 	/*
 	 * Run ChaCha20 once to generate the Poly1305 key. The IV is the
-	 * packet sequence number.
+	 * packet sequence number, block counter is reset to 0. First 32 bytes
+	 * of 64 byte ChaCha20 block are used for Poly1305 key and remaining
+	 * 32 bytes are discarded. Block counter is increased to 1.
 	 */
 	memset(poly_key, 0, sizeof(poly_key));
 	POKE_U64(seqbuf, seqnr);
-	chacha_ivsetup(&ctx->main_ctx, seqbuf, NULL);
-	chacha_encrypt_bytes(&ctx->main_ctx,
-	    poly_key, poly_key, sizeof(poly_key));
+	if (gcry_cipher_setiv(ctx->main_hd, seqbuf, sizeof(seqbuf)))
+		goto out;
+	if (gcry_cipher_encrypt(ctx->main_hd, poly_key, sizeof(poly_key),
+				NULL, 0))
+		goto out;
+	if (gcry_mac_setkey(ctx->mac_hd, poly_key, POLY1305_KEYLEN))
+		goto out;
 
 	/* If decrypting, check tag before anything else */
 	if (!do_encrypt) {
 		const u_char *tag = src + aadlen + len;
 
-		poly1305_auth(expected_tag, src, aadlen + len, poly_key);
-		if (timingsafe_bcmp(expected_tag, tag, POLY1305_TAGLEN) != 0) {
+		if (gcry_mac_write(ctx->mac_hd, src, aadlen + len))
+			goto out;
+		ret = gcry_mac_verify(ctx->mac_hd, tag, POLY1305_TAGLEN);
+		if (ret == GPG_ERR_CHECKSUM) {
 			r = SSH_ERR_MAC_INVALID;
 			goto out;
-		}
+		} else if (ret)
+			goto out;
 	}
 
 	/* Crypt additional data */
 	if (aadlen) {
-		chacha_ivsetup(&ctx->header_ctx, seqbuf, NULL);
-		chacha_encrypt_bytes(&ctx->header_ctx, src, dest, aadlen);
+		if (gcry_cipher_setiv(ctx->header_hd, seqbuf, sizeof(seqbuf)))
+			goto out;
+		if (gcry_cipher_encrypt(ctx->header_hd, dest, aadlen,
+					src, aadlen))
+			goto out;
 	}
 
-	/* Set Chacha's block counter to 1 */
-	chacha_ivsetup(&ctx->main_ctx, seqbuf, one);
-	chacha_encrypt_bytes(&ctx->main_ctx, src + aadlen,
-	    dest + aadlen, len);
+	if (do_encrypt) {
+		if (gcry_cipher_encrypt(ctx->main_hd, dest + aadlen, len,
+					src + aadlen, len))
+			goto out;
+	} else {
+		if (gcry_cipher_decrypt(ctx->main_hd, dest + aadlen, len,
+					src + aadlen, len))
+			goto out;
+	}
 
 	/* If encrypting, calculate and append tag */
 	if (do_encrypt) {
-		poly1305_auth(dest + aadlen + len, dest, aadlen + len,
-		    poly_key);
+		size_t taglen = POLY1305_TAGLEN;
+		if (gcry_mac_write(ctx->mac_hd, dest, aadlen + len))
+			goto out;
+		if (gcry_mac_read(ctx->mac_hd, dest + aadlen + len, &taglen))
+			goto out;
+		if (taglen != POLY1305_TAGLEN)
+			goto out;
 	}
 	r = 0;
  out:
-	explicit_bzero(expected_tag, sizeof(expected_tag));
 	explicit_bzero(seqbuf, sizeof(seqbuf));
 	explicit_bzero(poly_key, sizeof(poly_key));
 	return r;
@@ -111,8 +183,10 @@ chachapoly_get_length(struct chachapoly_ctx *ctx,
 	if (len < 4)
 		return SSH_ERR_MESSAGE_INCOMPLETE;
 	POKE_U64(seqbuf, seqnr);
-	chacha_ivsetup(&ctx->header_ctx, seqbuf, NULL);
-	chacha_encrypt_bytes(&ctx->header_ctx, cp, buf, 4);
+	if (gcry_cipher_setiv(ctx->header_hd, seqbuf, sizeof(seqbuf)))
+		return SSH_ERR_INTERNAL_ERROR;
+	if (gcry_cipher_decrypt(ctx->header_hd, buf, 4, cp, 4))
+		return SSH_ERR_INTERNAL_ERROR;
 	*plenp = PEEK_U32(buf);
 	return 0;
 }

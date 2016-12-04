@@ -19,15 +19,21 @@
 #define CHACHA_POLY_AEAD_H
 
 #include <sys/types.h>
-#include "chacha.h"
-#include "poly1305.h"
 
-#define CHACHA_KEYLEN	32 /* Only 256 bit keys used here */
+#include <gcrypt.h>
+
+#define CHACHA20_BLOCKSIZE 64
+
+#define POLY1305_KEYLEN 32
+#define POLY1305_TAGLEN 16
 
 struct chachapoly_ctx {
-	struct chacha_ctx main_ctx, header_ctx;
+	gcry_cipher_hd_t main_hd, header_hd;
+	gcry_mac_hd_t mac_hd;
+	int initialized;
 };
 
+void	chachapoly_free(struct chachapoly_ctx *cpctx);
 int	chachapoly_init(struct chachapoly_ctx *cpctx,
     const u_char *key, u_int keylen)
     __attribute__((__bounded__(__buffer__, 2, 3)));

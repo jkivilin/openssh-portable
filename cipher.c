@@ -471,9 +471,10 @@ cipher_cleanup(struct sshcipher_ctx *cc)
 {
 	if (cc == NULL || cc->cipher == NULL)
 		return 0;
-	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0)
+	if ((cc->cipher->flags & CFLAG_CHACHAPOLY) != 0) {
+		chachapoly_free(&cc->cp_ctx);
 		explicit_bzero(&cc->cp_ctx, sizeof(cc->cp_ctx));
-	else if ((cc->cipher->flags & CFLAG_AESCTR) != 0)
+	} else if ((cc->cipher->flags & CFLAG_AESCTR) != 0)
 		explicit_bzero(&cc->ac_ctx, sizeof(cc->ac_ctx));
 #ifdef WITH_OPENSSL
 	else if (EVP_CIPHER_CTX_cleanup(&cc->evp) == 0)

@@ -2841,6 +2841,9 @@ else
 	AC_CHECK_FUNCS([crypt])
 fi
 
+#libgcrypt
+AC_CHECK_LIB([gcrypt], [gcry_mac_open], [LIBS="$LIBS -lgcrypt"])
+
 AC_CHECK_FUNCS([ \
 	arc4random \
 	arc4random_buf \
